@@ -79,6 +79,7 @@ def _vmap_for_bhqkv(
     suffix: tuple[Optional[int], ...] = (),
     out_dims: Union[int, list[Optional[int]]] = 0,
     group_dim: bool = False,
+    chunk_size: Optional[int] = None,
 ):
     """Used to vmap both score_mods and mask_mods over 4-dimensional/5-dimension inputs.
     Mapping over the [b, hq, q_idx, kv_idx] or [b, hkv, g, q_idx, kv_idx] dimensions.
@@ -93,6 +94,7 @@ def _vmap_for_bhqkv(
                           we are only returning 1 output. For backwards, the joint
                           graph returns grads for B, H, Q_idx, KV_idx and other_buffers,
                           so we set this to (0, None, None, None, None) + (None,) * len(other_buffers).
+        chunk_size (int): Chunk size for vmap, trades off speed for memory.
 
     Returns:
         callable: The vmapped function.
@@ -115,7 +117,7 @@ def _vmap_for_bhqkv(
     ]
 
     for dims in dimensions:
-        fn = torch.vmap(fn, in_dims=prefix + dims + suffix, out_dims=out_dims)  # type: ignore[arg-type]
+        fn = torch.vmap(fn, in_dims=prefix + dims + suffix, out_dims=out_dims, chunk_size=chunk_size)  # type: ignore[arg-type]
     return fn
 
 
@@ -787,6 +789,7 @@ def create_mask(
     Q_LEN: int,
     KV_LEN: int,
     device: DeviceLikeType = "cuda",
+    vmap_chunk_size: Optional[int] = None,
 ) -> Tensor:
     r"""This function creates a mask tensor from a mod_fn function.
 
@@ -797,6 +800,7 @@ def create_mask(
         Q_LEN (int): Sequence length of query.
         KV_LEN (int): Sequence length of key/value.
         device (str): Device to run the mask creation on.
+        vmap_chunk_size (int): Chunk size for vmap. Smaller numbers save memory but cost speed.
 
     Returns:
         mask (Tensor): A mask tensor with shape (B, H, M, N).
@@ -816,13 +820,13 @@ def create_mask(
     with TransformGetItemToIndex():
         if mod_type == _ModificationType.SCORE_MOD:
             score_mod = mod_fn
-            score_mod = _vmap_for_bhqkv(score_mod, prefix=(0,))  # first input is score
+            score_mod = _vmap_for_bhqkv(score_mod, prefix=(0,), chunk_size=vmap_chunk_size)  # first input is score
             out = score_mod(torch.zeros(B, H, Q_LEN, KV_LEN, device=device), b, h, m, n)
             mask = torch.where(torch.isneginf(out), False, True)
             return mask
         elif mod_type == _ModificationType.MASK_MOD:
             mask_mod = mod_fn
-            mask_mod = _vmap_for_bhqkv(mask_mod, prefix=())
+            mask_mod = _vmap_for_bhqkv(mask_mod, prefix=(), chunk_size=vmap_chunk_size)
             mask = mask_mod(b, h, m, n)
             return mask
         else:
@@ -838,6 +842,7 @@ def create_block_mask(
     device: DeviceLikeType = "cuda",
     BLOCK_SIZE: Union[int, tuple[int, int]] = _DEFAULT_SPARSE_BLOCK_SIZE,
     _compile=False,
+    vmap_chunk_size: Optional[int] = None,
 ) -> BlockMask:
     r"""This function creates a block mask tuple from a mask_mod function.
 
@@ -893,7 +898,7 @@ def create_block_mask(
             mask_mod, B, H, Q_LEN, KV_LEN, device, BLOCK_SIZE
         )
 
-    mask_tensor = create_mask(mask_mod, B, H, Q_LEN, KV_LEN, device)
+    mask_tensor = create_mask(mask_mod, B, H, Q_LEN, KV_LEN, device, vmap_chunk_size)
     partial_block_mask, full_block_mask = _convert_mask_to_block_mask(
         mask_tensor,
         Q_BLOCK_SIZE=Q_BLOCK_SIZE,
